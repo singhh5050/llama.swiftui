@@ -1,0 +1,47 @@
+# Xcode
+xcuserdata/
+xcshareddata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+project.xcworkspace/
+DerivedData/
+.build/
+
+# Model files (large binary files - DO NOT COMMIT)
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.model
+
+# macOS system files
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Generated benchmark CSVs
+llama_benchmark_*.csv
+
+# Build artifacts
+llama.xcframework/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Backup files
+*~
+*.bak
+
+# Large directories that shouldn't be committed
+Resources/models/
+
+# Log files
+*.log
+
+# Swift Package Manager
+.swiftpm/
+Package.resolved
