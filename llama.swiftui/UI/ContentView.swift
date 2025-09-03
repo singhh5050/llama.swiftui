@@ -95,6 +95,10 @@ struct ContentView: View {
             }
             .padding()
             .navigationBarTitle("Model Settings", displayMode: .inline)
+            .onTapGesture {
+                // Dismiss keyboard when tapping anywhere on the view
+                UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+            }
 
         }
     }

@@ -119,6 +119,10 @@ struct InputButton: View {
                 Text("Unknown status")
             }
         }
+        .onTapGesture {
+            // Dismiss keyboard when tapping anywhere on the view
+            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        }
         .onDisappear() {
             downloadTask?.cancel()
         }

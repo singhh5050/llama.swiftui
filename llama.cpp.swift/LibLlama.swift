@@ -9,19 +9,27 @@ func llama_batch_clear(_ batch: inout llama_batch) {
     batch.n_tokens = 0
 }
 
-func llama_batch_add(_ batch: inout llama_batch, _ id: llama_token, _ pos: llama_pos, _ seq_ids: [llama_seq_id], _ logits: Bool) {
-    batch.token   [Int(batch.n_tokens)] = id
-    batch.pos     [Int(batch.n_tokens)] = pos
-    batch.n_seq_id[Int(batch.n_tokens)] = Int32(seq_ids.count)
-    for i in 0..<seq_ids.count {
-        guard let seq_id_ptr = batch.seq_id[Int(batch.n_tokens)] else {
-            print("Error: batch.seq_id is nil - batch not properly initialized")
-            return
-        }
-        seq_id_ptr[Int(i)] = seq_ids[i]
-    }
-    batch.logits  [Int(batch.n_tokens)] = logits ? 1 : 0
+func llama_batch_add(_ batch: inout llama_batch, 
+                     _ id: llama_token, 
+                     _ pos: llama_pos, 
+                     _ seq_ids: [llama_seq_id], 
+                     _ logits: Bool, 
+                     capacity: Int, 
+                     nSeqMax: Int32) {
+    let idx = Int(batch.n_tokens)
+    precondition(idx < capacity, "llama_batch_add: capacity exceeded (\(idx) >= \(capacity))")
+    precondition(seq_ids.count <= Int(nSeqMax), "llama_batch_add: seq_ids.count (\(seq_ids.count)) > nSeqMax (\(nSeqMax))")
 
+    batch.token[idx]    = id
+    batch.pos[idx]      = pos
+    batch.n_seq_id[idx] = Int32(seq_ids.count)
+
+    guard let seqBuf = batch.seq_id[idx] else {
+        fatalError("llama_batch_add: seq_id[\(idx)] is nil — bad batch init or ABI mismatch")
+    }
+    for i in 0..<seq_ids.count { seqBuf[i] = seq_ids[i] }
+
+    batch.logits[idx] = logits ? 1 : 0
     batch.n_tokens += 1
 }
 
@@ -33,6 +41,10 @@ actor LlamaContext {
     private var batch: llama_batch
     private var tokens_list: [llama_token]
     var is_done: Bool = false
+    
+    // Track batch capacity for safe allocation
+    private var batchCapacity: Int = 256
+    private var batchSeqMax: Int32 = 1
 
     /// This variable is used to store temporarily invalid cchars
     private var temporary_invalid_cchars: [CChar]
@@ -41,7 +53,7 @@ actor LlamaContext {
     private var stopTokens: [String] = []
     private var generatedText: String = ""
 
-    var n_len: Int32 = 512  // Use more conservative default
+    var n_len: Int32 = 1024
     var n_cur: Int32 = 0
 
     var n_decode: Int32 = 0
@@ -58,7 +70,13 @@ actor LlamaContext {
         self.model = model
         self.context = context
         self.tokens_list = []
-        self.batch = llama_batch_init(512, 0, 1)  // Use default batch size
+        self.batchCapacity = 256
+        self.batchSeqMax = 1
+        self.batch = llama_batch_init(Int32(batchCapacity), 0, batchSeqMax)
+        
+        // Sanity check - catches token/embedding mode mismatch instantly
+        precondition(batch.token != nil, "token buffer is nil; did you init llama_batch with embd > 0?")
+        
         self.temporary_invalid_cchars = []
         self.stopTokens = stopTokens
         let sparams = llama_sampler_chain_default_params()
@@ -75,6 +93,19 @@ actor LlamaContext {
         llama_free(context)
         llama_backend_free()
     }
+    
+    // Helper to ensure batch capacity
+    private func ensureBatchCapacity(_ required: Int, nSeqMax: Int32 = 1) {
+        if required <= batchCapacity && nSeqMax <= batchSeqMax { return }
+        // grow to max(required, oldCapacity) and max seq lanes
+        batchCapacity = max(required, batchCapacity)
+        batchSeqMax   = max(nSeqMax, batchSeqMax)
+        llama_batch_free(batch)
+        batch = llama_batch_init(Int32(batchCapacity), 0, batchSeqMax)
+        
+        // Sanity check - catches token/embedding mode mismatch instantly
+        precondition(batch.token != nil, "token buffer is nil; did you init llama_batch with embd > 0?")
+    }
 
     static func create_context(path: String, stopTokens: [String] = []) async throws -> LlamaContext {
         llama_backend_init()
@@ -82,11 +113,11 @@ actor LlamaContext {
 
 #if targetEnvironment(simulator)
         model_params.n_gpu_layers = 0
-        print("Running on simulator, n_gpu_layers = 0")
+        print("Running on simulator, force use n_gpu_layers = 0")
 #else
-        // Use llama.cpp default: -1 offloads all layers to GPU
-        model_params.n_gpu_layers = -1
-        print("Using default GPU offloading, n_gpu_layers = -1")
+        // Use maximum GPU layers for performance (high number ensures all layers are used)
+        model_params.n_gpu_layers = 99  // High number to ensure all model layers are offloaded
+        print("Using maximum GPU layers (99) for optimal performance")
 #endif
         let model = llama_model_load_from_file(path, model_params)
         guard let model else {
@@ -99,7 +130,9 @@ actor LlamaContext {
 
         var ctx_params = llama_context_default_params()
         
-        // Use default context settings, only set thread count
+        // Standardized context and batch settings for benchmarking
+        ctx_params.n_ctx = 1024
+        ctx_params.n_batch = 256
         ctx_params.n_threads = Int32(n_threads)
         ctx_params.n_threads_batch = Int32(n_threads)
 
@@ -137,6 +170,104 @@ actor LlamaContext {
         return batch.n_tokens;
     }
 
+    // Helpers for chat template
+    private func buildSystemPrefix(_ system: String) -> String {
+        """
+        <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        \(system)
+        <|eot_id|>
+        <|start_header_id|>user<|end_header_id|>
+        """
+    }
+    
+    private func buildUserSuffix(_ user: String) -> String {
+        """
+        \(user)
+        <|eot_id|>
+        <|start_header_id|>assistant<|end_header_id|>
+        """
+    }
+    
+    /// Feed full system + trimmed user, then run prefill.
+    /// - maxNewTokens: tokens to generate (sets n_len)
+    /// - maxUserTokens: hard cap on user tokens before fitting to n_ctx
+    func completion_init(system: String,
+                         user: String,
+                         maxNewTokens: Int = 512,
+                         maxUserTokens: Int = .max) {
+        print("attempting to complete (system len=\(system.count), user len=\(user.count))")
+
+        // Set generation length based on user request
+        n_len = Int32(max(1, maxNewTokens))
+
+        // Reset benchmarking metrics
+        prefillStartTime = DispatchTime.now().uptimeNanoseconds
+        firstTokenTime = 0
+        decodeStartTime = 0
+        totalDecodeTokens = 0
+        isFirstToken = true
+        temporary_invalid_cchars = []
+        generatedText = ""
+
+        // Build strings for tokenization
+        let sysPrefix = buildSystemPrefix(system)
+        let userBlock = buildUserSuffix(user)
+
+        // Tokenize separately so we can protect system
+        let sysTok  = tokenize(text: sysPrefix, add_bos: true)
+        var userTok = tokenize(text: userBlock, add_bos: false)
+
+        // Optional hard cap on user segment (keeps the *tail* / most recent)
+        if userTok.count > maxUserTokens {
+            userTok = Array(userTok.suffix(maxUserTokens))
+            print("User trimmed to maxUserTokens=\(maxUserTokens)")
+        }
+
+        // Fit to context: keep all system tokens, trim user only
+        let nctx = Int(llama_n_ctx(context))
+        let reserve = min(maxNewTokens, nctx - 1)        // room for generation
+        let budgetForPrompt = max(1, nctx - reserve)     // room for system+user
+
+        var availForUser = max(0, budgetForPrompt - sysTok.count)
+        if availForUser < userTok.count {
+            userTok = Array(userTok.suffix(availForUser))
+            print("User trimmed to fit n_ctx: \(userTok.count) tokens (reserved \(reserve))")
+        }
+
+        // Final prompt tokens (system kept fully)
+        let toks = sysTok + userTok
+        totalPrefillTokens = toks.count
+        tokens_list = toks
+
+        // Ensure batch capacity can hold the entire prefill in one shot
+        ensureBatchCapacity(toks.count, nSeqMax: 1)
+
+        print("\n n_len = \(n_len), n_ctx = \(nctx), prefill_tokens = \(toks.count), reserve = \(reserve)")
+
+        for id in toks {
+            print(String(cString: token_to_piece(token: id) + [0]))
+        }
+
+        llama_batch_clear(&batch)
+
+        // Add all prefill tokens
+        for (i, id) in toks.enumerated() {
+            llama_batch_add(&batch, id, Int32(i), [0], false, capacity: batchCapacity, nSeqMax: batchSeqMax)
+        }
+        // Request logits for the last prefill token
+        batch.logits[Int(batch.n_tokens) - 1] = 1 // true
+
+        // Decode prefill
+        if llama_decode(context, batch) != 0 {
+            print("llama_decode() failed")
+        }
+
+        n_cur = batch.n_tokens
+        
+        // Mark end of prefill phase
+        decodeStartTime = DispatchTime.now().uptimeNanoseconds
+    }
+    
     func completion_init(text: String) {
         print("attempting to complete \"\(text)\"")
 
@@ -147,37 +278,47 @@ actor LlamaContext {
         totalDecodeTokens = 0
         isFirstToken = true
 
-        tokens_list = tokenize(text: text, add_bos: true)
-        totalPrefillTokens = tokens_list.count
+        var toks = tokenize(text: text, add_bos: true)
+        totalPrefillTokens = toks.count
         temporary_invalid_cchars = []
         generatedText = ""
 
-        let n_ctx = llama_n_ctx(context)
-        let n_kv_req = tokens_list.count + (Int(n_len) - tokens_list.count)
+        let n_ctx = Int(llama_n_ctx(context))
 
-        print("\n n_len = \(n_len), n_ctx = \(n_ctx), n_kv_req = \(n_kv_req)")
+        // Reserve space for generation - max prefill tokens
+        let maxPrompt = max(1, n_ctx - Int(n_len))
 
-        if n_kv_req > n_ctx {
-            print("error: n_kv_req > n_ctx, the required KV cache size is not big enough")
+        if toks.count > maxPrompt {
+            // keep the most recent tokens (tail) so semantics stay freshest
+            toks = Array(toks.suffix(maxPrompt))
+            print("Prefill truncated to \(toks.count) to fit n_ctx \(n_ctx) with \(n_len) reserved")
         }
 
-        for id in tokens_list {
+        // Ensure batch capacity can hold the entire prefill in one shot
+        ensureBatchCapacity(toks.count, nSeqMax: 1)
+
+        print("\n n_len = \(n_len), n_ctx = \(n_ctx), prefill_tokens = \(toks.count)")
+
+        for id in toks {
             print(String(cString: token_to_piece(token: id) + [0]))
         }
 
         llama_batch_clear(&batch)
 
-        for i1 in 0..<tokens_list.count {
-            let i = Int(i1)
-            llama_batch_add(&batch, tokens_list[i], Int32(i), [0], false)
+        // Add all prefill tokens
+        for (i, id) in toks.enumerated() {
+            llama_batch_add(&batch, id, Int32(i), [0], false, capacity: batchCapacity, nSeqMax: batchSeqMax)
         }
+        // Request logits for the last prefill token
         batch.logits[Int(batch.n_tokens) - 1] = 1 // true
 
+        // Decode prefill
         if llama_decode(context, batch) != 0 {
             print("llama_decode() failed")
         }
 
         n_cur = batch.n_tokens
+        tokens_list = toks // keep if you want to track them
         
         // Mark end of prefill phase
         decodeStartTime = DispatchTime.now().uptimeNanoseconds
@@ -194,6 +335,15 @@ actor LlamaContext {
 
         new_token_id = llama_sampler_sample(sampling, context, batch.n_tokens - 1)
 
+        // Hard stop if context is full
+        if n_cur >= Int32(llama_n_ctx(context)) {
+            print("\nStopped: context full")
+            is_done = true
+            let new_token_str = String(cString: temporary_invalid_cchars + [0])
+            temporary_invalid_cchars.removeAll()
+            return new_token_str
+        }
+        
         if llama_vocab_is_eog(vocab, new_token_id) || n_cur == n_len {
             print("\n")
             is_done = true
@@ -239,7 +389,9 @@ actor LlamaContext {
         // tokens_list.append(new_token_id)
 
         llama_batch_clear(&batch)
-        llama_batch_add(&batch, new_token_id, n_cur, [0], true)
+        // only 1 token per decode step → capacity 1 is enough, but we'll reuse the same batch
+        ensureBatchCapacity(1, nSeqMax: 1)
+        llama_batch_add(&batch, new_token_id, n_cur, [0], true, capacity: batchCapacity, nSeqMax: batchSeqMax)
 
         n_decode += 1
         n_cur    += 1
@@ -264,9 +416,12 @@ actor LlamaContext {
             llama_batch_clear(&batch)
 
             let n_tokens = pp
+            
+            // Ensure batch capacity for benchmark
+            ensureBatchCapacity(n_tokens, nSeqMax: 1)
 
             for i in 0..<n_tokens {
-                llama_batch_add(&batch, 0, Int32(i), [0], false)
+                llama_batch_add(&batch, 0, Int32(i), [0], false, capacity: batchCapacity, nSeqMax: batchSeqMax)
             }
             batch.logits[Int(batch.n_tokens) - 1] = 1 // true
 
@@ -289,9 +444,12 @@ actor LlamaContext {
 
             for i in 0..<tg {
                 llama_batch_clear(&batch)
+                
+                // Ensure batch capacity for parallel sequences
+                ensureBatchCapacity(pl, nSeqMax: Int32(pl))
 
                 for j in 0..<pl {
-                    llama_batch_add(&batch, 0, Int32(i), [Int32(j)], true)
+                    llama_batch_add(&batch, 0, Int32(i), [Int32(j)], true, capacity: batchCapacity, nSeqMax: batchSeqMax)
                 }
 
                 if llama_decode(context, batch) != 0 {

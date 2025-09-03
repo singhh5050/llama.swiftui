@@ -20,7 +20,7 @@ class LlamaState: ObservableObject {
     private var currentModelUrl: URL?
     private var customSystemPrompt: String?
     private var defaultModelUrl: URL? {
-        Bundle.main.url(forResource: "google_gemma-3n-E4B-it-Q4_K_M", withExtension: "gguf", subdirectory: "models")
+        Bundle.main.url(forResource: "Llama-3.2-3B-Instruct-Q4_K_M", withExtension: "gguf", subdirectory: "models")
         // Bundle.main.url(forResource: "llama-2-7b-chat", withExtension: "Q2_K.gguf", subdirectory: "models")
     }
 
@@ -150,26 +150,16 @@ class LlamaState: ObservableObject {
         }
 
         // Check if text looks like a raw user message (no special tokens)
-        let processedText: String
         if !text.contains("<|") && !text.contains("[INST]") && !text.contains("<start_of_turn>") {
-            // This looks like a plain user message, format it with the system prompt
-            if let modelUrl = getCurrentModelUrl() {
-                let modelInfo = ModelStopTokens.getModelInfo(for: modelUrl.lastPathComponent)
-                processedText = ModelStopTokens.formatPrompt(
-                    template: modelInfo.promptTemplate,
-                    systemPrompt: customSystemPrompt,
-                    userMessage: text
-                )
-                messageLog += "Using formatted prompt with system instructions\n"
-            } else {
-                processedText = text
-            }
+            // This looks like a plain user message, use the new system+user method
+            let systemPrompt = customSystemPrompt ?? "You are a clear and focused assistant. Aim for concise, complete answers. Use plain language and short paragraphs. When listing points, use brief bullet points or numbers. Wrap up naturally once the question is fully addressed. Keep the tone helpful and conversational."
+            
+            await llamaContext.completion_init(system: systemPrompt, user: text, maxNewTokens: 512)
+            messageLog += "Using system+user prompt separation\n"
         } else {
-            // Text already has formatting, use as-is
-            processedText = text
+            // Text already has formatting, use the old method
+            await llamaContext.completion_init(text: text)
         }
-
-        await llamaContext.completion_init(text: processedText)
         messageLog += "\(text)"
 
         Task.detached {
