@@ -43,7 +43,7 @@ actor LlamaContext {
     var is_done: Bool = false
     
     // Track batch capacity for safe allocation
-    private var batchCapacity: Int = 256
+    private var batchCapacity: Int = 512  // Match n_batch for longer prompts
     private var batchSeqMax: Int32 = 1
 
     /// This variable is used to store temporarily invalid cchars
@@ -52,6 +52,17 @@ actor LlamaContext {
     /// Stop tokens for this model
     private var stopTokens: [String] = []
     private var generatedText: String = ""
+    
+    /// Stop token IDs for efficient checking
+    private lazy var stopIDs: Set<llama_token> = {
+        var s = Set<llama_token>()
+        if let eot = tokenize(text: "<|eot_id|>", add_bos: false, allow_special: true).first {
+            s.insert(eot)
+        }
+        let eos = llama_token_eos(vocab)
+        if eos >= 0 { s.insert(eos) }
+        return s
+    }()
 
     var n_len: Int32 = 1024
     var n_cur: Int32 = 0
@@ -70,7 +81,7 @@ actor LlamaContext {
         self.model = model
         self.context = context
         self.tokens_list = []
-        self.batchCapacity = 256
+        self.batchCapacity = 512  // Match n_batch for longer prompts
         self.batchSeqMax = 1
         self.batch = llama_batch_init(Int32(batchCapacity), 0, batchSeqMax)
         
@@ -130,9 +141,9 @@ actor LlamaContext {
 
         var ctx_params = llama_context_default_params()
         
-        // Standardized context and batch settings for benchmarking
-        ctx_params.n_ctx = 1024
-        ctx_params.n_batch = 256
+        // Standardized context and batch settings for benchmarking  
+        ctx_params.n_ctx = 2048  // Increased to support 512 generated tokens + longer prompts
+        ctx_params.n_batch = 512  // Higher limit for longer prompts
         ctx_params.n_threads = Int32(n_threads)
         ctx_params.n_threads_batch = Int32(n_threads)
 
@@ -143,9 +154,24 @@ actor LlamaContext {
         }
 
         let llamaContext = LlamaContext(model: model, context: context, stopTokens: stopTokens)
+        
+        // Verify this is an Instruct model by checking if it recognizes <|eot_id|>
+        await llamaContext.verifyInstructModel()
+        
         return llamaContext
     }
 
+    func verifyInstructModel() {
+        let testTokens = tokenize(text: "<|eot_id|>", add_bos: false, allow_special: true)
+        if testTokens.count != 1 {
+            print("Warning: Tokenizer doesn't recognize <|eot_id|> as a single token (got \(testTokens.count) tokens)")
+            print("This may indicate you're using a base model instead of an Instruct model")
+            print("Consider using a model with 'Instruct' in the filename for proper chat functionality")
+        } else {
+            print("✅ Model correctly recognizes special tokens - Instruct model confirmed")
+        }
+    }
+    
     func model_info() -> String {
         let result = UnsafeMutablePointer<Int8>.allocate(capacity: 256)
         result.initialize(repeating: Int8(0), count: 256)
@@ -200,6 +226,9 @@ actor LlamaContext {
         // Set generation length based on user request
         n_len = Int32(max(1, maxNewTokens))
 
+        // Reset completion state
+        is_done = false
+        
         // Reset benchmarking metrics
         prefillStartTime = DispatchTime.now().uptimeNanoseconds
         firstTokenTime = 0
@@ -213,9 +242,10 @@ actor LlamaContext {
         let sysPrefix = buildSystemPrefix(system)
         let userBlock = buildUserSuffix(user)
 
-        // Tokenize separately so we can protect system
-        let sysTok  = tokenize(text: sysPrefix, add_bos: true)
-        var userTok = tokenize(text: userBlock, add_bos: false)
+        // Tokenize separately so we can protect system - use allow_special=true for chat templates
+        // Note: sysPrefix already contains <|begin_of_text|> so don't add another BOS
+        let sysTok  = tokenize(text: sysPrefix, add_bos: false, allow_special: true)
+        var userTok = tokenize(text: userBlock, add_bos: false, allow_special: true)
 
         // Optional hard cap on user segment (keeps the *tail* / most recent)
         if userTok.count > maxUserTokens {
@@ -225,13 +255,17 @@ actor LlamaContext {
 
         // Fit to context: keep all system tokens, trim user only
         let nctx = Int(llama_n_ctx(context))
+        let contextBatchSize = Int(llama_n_batch(context))
         let reserve = min(maxNewTokens, nctx - 1)        // room for generation
         let budgetForPrompt = max(1, nctx - reserve)     // room for system+user
+        
+        // Also respect batch size limit - this is the hard limit that causes crashes
+        let maxPromptTokens = min(budgetForPrompt, contextBatchSize)
 
-        var availForUser = max(0, budgetForPrompt - sysTok.count)
+        var availForUser = max(0, maxPromptTokens - sysTok.count)
         if availForUser < userTok.count {
             userTok = Array(userTok.suffix(availForUser))
-            print("User trimmed to fit n_ctx: \(userTok.count) tokens (reserved \(reserve))")
+            print("User trimmed to fit batch/context limits: \(userTok.count) tokens (batch_size=\(contextBatchSize), reserved=\(reserve))")
         }
 
         // Final prompt tokens (system kept fully)
@@ -241,8 +275,13 @@ actor LlamaContext {
 
         // Ensure batch capacity can hold the entire prefill in one shot
         ensureBatchCapacity(toks.count, nSeqMax: 1)
+        
+        // This should never happen now, but keep as final safety check
+        if toks.count > contextBatchSize {
+            print("ERROR: Prompt still exceeds batch size after trimming! This shouldn't happen.")
+        }
 
-        print("\n n_len = \(n_len), n_ctx = \(nctx), prefill_tokens = \(toks.count), reserve = \(reserve)")
+        print("\n n_len = \(n_len), n_ctx = \(nctx), prefill_tokens = \(toks.count), reserve = \(reserve), n_batch = \(contextBatchSize)")
 
         for id in toks {
             print(String(cString: token_to_piece(token: id) + [0]))
@@ -271,6 +310,9 @@ actor LlamaContext {
     func completion_init(text: String) {
         print("attempting to complete \"\(text)\"")
 
+        // Reset completion state
+        is_done = false
+
         // Reset benchmarking metrics
         prefillStartTime = DispatchTime.now().uptimeNanoseconds
         firstTokenTime = 0
@@ -284,20 +326,29 @@ actor LlamaContext {
         generatedText = ""
 
         let n_ctx = Int(llama_n_ctx(context))
+        let contextBatchSize = Int(llama_n_batch(context))
 
         // Reserve space for generation - max prefill tokens
         let maxPrompt = max(1, n_ctx - Int(n_len))
+        
+        // Also respect batch size limit - this is the hard limit that causes crashes
+        let maxPromptTokens = min(maxPrompt, contextBatchSize)
 
-        if toks.count > maxPrompt {
+        if toks.count > maxPromptTokens {
             // keep the most recent tokens (tail) so semantics stay freshest
-            toks = Array(toks.suffix(maxPrompt))
-            print("Prefill truncated to \(toks.count) to fit n_ctx \(n_ctx) with \(n_len) reserved")
+            toks = Array(toks.suffix(maxPromptTokens))
+            print("Prefill truncated to \(toks.count) to fit batch/context limits (batch_size=\(contextBatchSize), n_ctx=\(n_ctx), reserved=\(n_len))")
         }
 
         // Ensure batch capacity can hold the entire prefill in one shot
         ensureBatchCapacity(toks.count, nSeqMax: 1)
+        
+        // This should never happen now, but keep as final safety check
+        if toks.count > contextBatchSize {
+            print("ERROR: Prompt still exceeds batch size after trimming! This shouldn't happen.")
+        }
 
-        print("\n n_len = \(n_len), n_ctx = \(n_ctx), prefill_tokens = \(toks.count)")
+        print("\n n_len = \(n_len), n_ctx = \(n_ctx), prefill_tokens = \(toks.count), n_batch = \(contextBatchSize)")
 
         for id in toks {
             print(String(cString: token_to_piece(token: id) + [0]))
@@ -344,8 +395,9 @@ actor LlamaContext {
             return new_token_str
         }
         
-        if llama_vocab_is_eog(vocab, new_token_id) || n_cur == n_len {
-            print("\n")
+        // Check for stop token IDs (including <|eot_id|>) or generation limit
+        if stopIDs.contains(new_token_id) || llama_vocab_is_eog(vocab, new_token_id) || n_cur == n_len {
+            print("\nStopped: stop token or generation limit reached")
             is_done = true
             let new_token_str = String(cString: temporary_invalid_cchars + [0])
             temporary_invalid_cchars.removeAll()
@@ -541,11 +593,11 @@ actor LlamaContext {
         return Int64(llama_model_n_params(model))
     }
 
-    private func tokenize(text: String, add_bos: Bool) -> [llama_token] {
+    private func tokenize(text: String, add_bos: Bool, allow_special: Bool = false) -> [llama_token] {
         let utf8Count = text.utf8.count
         let n_tokens = utf8Count + (add_bos ? 1 : 0) + 1
         let tokens = UnsafeMutablePointer<llama_token>.allocate(capacity: n_tokens)
-        let tokenCount = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, false)
+        let tokenCount = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, allow_special)
 
         var swiftTokens: [llama_token] = []
         for i in 0..<tokenCount {

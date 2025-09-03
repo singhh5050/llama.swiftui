@@ -109,7 +109,7 @@ class PromptBankManager: ObservableObject {
         print("Using fallback prompts: \(prompts.count)")
     }
     
-    func runBenchmark(llamaState: LlamaState, maxPrompts: Int? = nil, maxTokens: Int = 100) async {
+    func runBenchmark(llamaState: LlamaState, maxPrompts: Int? = nil, maxTokens: Int = 512) async {
         guard !isBenchmarking else { return }
         
         isBenchmarking = true
@@ -170,7 +170,7 @@ class PromptBankManager: ObservableObject {
         print("Benchmark completed! Tested \(benchmarkResults.count) prompts")
     }
     
-    func runBenchmarkRange(llamaState: LlamaState, startIndex: Int, endIndex: Int, maxTokens: Int = 100) async {
+    func runBenchmarkRange(llamaState: LlamaState, startIndex: Int, endIndex: Int, maxTokens: Int = 512) async {
         guard !isBenchmarking else { return }
         guard startIndex >= 0, endIndex < prompts.count, startIndex <= endIndex else {
             print("Invalid range: \(startIndex)-\(endIndex)")
@@ -236,7 +236,7 @@ class PromptBankManager: ObservableObject {
         print("Range benchmark completed! Tested \(benchmarkResults.count) prompts (range \(startIndex+1)-\(endIndex+1))")
     }
     
-    private func runSingleBenchmark(prompt: PromptBankItem, index: Int, llamaState: LlamaState, maxTokens: Int = 100) async -> BenchmarkResult? {
+    private func runSingleBenchmark(prompt: PromptBankItem, index: Int, llamaState: LlamaState, maxTokens: Int = 512) async -> BenchmarkResult? {
         // Guard against nil context
         guard let llamaContext = await llamaState.getLlamaContext() else {
             print("Error: LlamaContext is nil for prompt \(index)")
@@ -256,8 +256,9 @@ class PromptBankManager: ObservableObject {
                 return nil
             }
             
-            // Initialize completion with error handling
-            await llamaContext.completion_init(text: prompt.prompt)
+            // Initialize completion using the same system+user format as chat
+            let systemPrompt = "You are a clear and focused assistant. Aim for concise, complete answers. Use plain language and short paragraphs. When listing points, use brief bullet points or numbers. Wrap up naturally once the question is fully addressed. Keep the tone helpful and conversational."
+            await llamaContext.completion_init(system: systemPrompt, user: prompt.prompt, maxNewTokens: maxTokens)
             
             // Run completion loop until done with timeout protection
             var generatedTokens = 0
