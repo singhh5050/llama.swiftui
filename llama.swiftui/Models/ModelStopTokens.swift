@@ -71,9 +71,11 @@ struct ModelStopTokens {
     
     static func detectModelCompany(from filename: String) -> String {
         let name = filename.lowercased()
+        print("🔍 Model detection for filename: '\(filename)' -> lowercase: '\(name)'")
         
         // Specific model version detection (most specific first)
         if name.contains("llama-3.2") || name.contains("llama_3.2") {
+            print("✅ Detected as llama-3.2")
             return "llama-3.2"
         } else if name.contains("llama-3.1") || name.contains("llama_3.1") {
             return "llama-3.1"
@@ -109,6 +111,7 @@ struct ModelStopTokens {
         } else if name.contains("gemma-2") || name.contains("gemma_2") {
             return "gemma-2"
         } else if name.contains("gemma") || name.contains("google") {
+            print("⚠️ Detected as gemma (this might be wrong!)")
             return "gemma"
         }
         
@@ -131,6 +134,7 @@ struct ModelStopTokens {
             return "orca"
         }
         
+        print("⚠️ Using default detection")
         return "default"
     }
     
@@ -206,6 +210,8 @@ struct ModelStopTokens {
         let detectedType = detectModelCompany(from: filename)
         let stopTokens = getStopTokens(for: detectedType)
         let promptTemplate = getPromptTemplate(for: detectedType)
+        
+        print("🎯 Final model info - Type: '\(detectedType)', Stop tokens: \(stopTokens)")
         
         return (type: detectedType, stopTokens: stopTokens, promptTemplate: promptTemplate)
     }

@@ -15,7 +15,8 @@ struct BenchmarkView: View {
     
     var body: some View {
         NavigationView {
-            VStack(spacing: 20) {
+            ScrollView {
+                VStack(spacing: 20) {
                 // Header
                 VStack {
                     Text("Prompt Bank Benchmark")
@@ -186,8 +187,6 @@ struct BenchmarkView: View {
                     .cornerRadius(10)
                 }
                 
-                Spacer()
-                
                 // Action Buttons
                 VStack(spacing: 15) {
                     Button(action: startBenchmark) {
@@ -237,8 +236,12 @@ struct BenchmarkView: View {
                     }
                 }
                 .padding()
+                
+                // Extra spacer at bottom so user can scroll bottommost button to top of screen
+                Spacer(minLength: 300)
+                }
+                .padding()
             }
-            .padding()
             .navigationTitle("Benchmark")
             .navigationBarTitleDisplayMode(.inline)
             .onTapGesture {
